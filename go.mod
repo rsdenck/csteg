@@ -1,4 +1,4 @@
-module github.com/rsdenck/csteg-agent
+module github.com/rsdenck/cstage-agent
 
 go 1.25.6
 
