@@ -1,167 +1,280 @@
 ============================================================
-GORILLA AGENT ↔ GORILLA BACKEND
-COMMUNICATION ARCHITECTURE
+GORILLA OBSERVABILITY PLATFORM
+BACKEND INGESTION ARCHITECTURE
 ============================================================
 
 OBJECTIVE
 
-Define a secure, scalable, OTEL-native communication model
-between gorilla_agent and gorilla_backend.
+Design a scalable, multi-tenant, OTEL-native ingestion
+architecture for:
+
+- metrics
+- logs
+- traces
 
 ============================================================
-COMMUNICATION MODES
+HIGH LEVEL ARCHITECTURE
 ============================================================
 
-MODE 1: OTEL NATIVE (PRIMARY)
-MODE 2: GORILLA CONTROL CHANNEL (CONFIG + MGMT)
-MODE 3: COMPATIBILITY PASSIVE MODE (OPTIONAL)
+               ┌────────────────────┐
+               │   gorilla_agent    │
+               └─────────┬──────────┘
+                         │ OTLP
+                         ▼
+               ┌────────────────────┐
+               │  ingress gateway   │
+               │  (load balancer)   │
+               └─────────┬──────────┘
+                         ▼
+               ┌────────────────────┐
+               │ otlp receiver tier │
+               └─────────┬──────────┘
+                         ▼
+               ┌────────────────────┐
+               │ validation layer   │
+               └─────────┬──────────┘
+                         ▼
+               ┌────────────────────┐
+               │ tenant isolation   │
+               └─────────┬──────────┘
+                         ▼
+      ┌──────────────┬───────────────┬───────────────┐
+      ▼              ▼               ▼
+ metrics pipeline   logs pipeline    traces pipeline
+      ▼              ▼               ▼
+ metrics storage    logs storage     traces storage
 
 ============================================================
-GLOBAL DESIGN PRINCIPLE
+INGRESS LAYER
 ============================================================
 
-- telemetry always via otlp
-- configuration always via control api
-- no telemetry via custom json protocol
-- no simulated transport
-- tls mandatory in production
-- multi-tenant header required
+COMPONENT:
+gorilla_ingress
 
-============================================================
-1) TELEMETRY CHANNEL (PRIMARY DATA FLOW)
-============================================================
-
-PROTOCOL:
-- otlp grpc (preferred)
-- otlp http (fallback)
+RESPONSIBILITIES:
+- tls termination
+- rate limiting
+- request validation
+- compression handling
+- routing to otlp receivers
 
 PORTS:
 - 4317 (grpc)
 - 4318 (http)
 
-FLOW:
-
-gorilla_agent
-    -> collect metrics/logs/traces
-    -> create otel resource attributes
-    -> batch
-    -> export via otlp
-    -> gorilla_backend otel receiver
-    -> internal pipeline
-    -> storage (metrics/logs/traces db)
-
-RESOURCE ATTRIBUTES REQUIRED:
-
-service.name=gorilla_agent
-service.namespace=gorilla
-agent.version=3
-host.name=<hostname>
-tenant.id=<uuid>
-environment=<prod|staging|dev>
-
-NO custom telemetry format allowed.
+REQUIREMENTS:
+- tls 1.2+
+- multi-tenant header validation
+- reject anonymous traffic
 
 ============================================================
-2) CONTROL CHANNEL (CONFIGURATION + MANAGEMENT)
+OTLP RECEIVER TIER
 ============================================================
 
-PROTOCOL:
-- https rest api
-- optional grpc control api
+COMPONENT:
+gorilla_otel_receiver
 
-PORT:
-- 8443 (default)
+FUNCTION:
+- receive otlp metrics/logs/traces
+- decode protobuf
+- forward to processing layer
 
-FLOW (ACTIVE MODE):
-
-gorilla_agent
-    -> authenticate
-    -> fetch assigned templates
-    -> fetch item definitions
-    -> fetch schedule
-    -> receive policy updates
-
-ENDPOINTS (BACKEND):
-
-GET  /api/v1/agent/bootstrap
-GET  /api/v1/agent/templates
-GET  /api/v1/agent/schedule
-POST /api/v1/agent/heartbeat
-POST /api/v1/agent/status
-
-AUTHENTICATION:
-
-- mTLS (recommended)
-or
-- agent token (signed jwt)
-or
-- api key (scoped per tenant)
+SCALE:
+- horizontally scalable
+- stateless
+- auto-discoverable
 
 ============================================================
-3) PASSIVE MODE (OPTIONAL - ZABBIX STYLE)
+VALIDATION LAYER
 ============================================================
 
-PORT:
-10050
+VALIDATIONS:
 
-FLOW:
+- agent_id exists
+- tenant_id valid
+- signature valid
+- schema valid
+- payload size limit
+- timestamp sanity check
 
-backend -> tcp request key
-gorilla_agent resolves collector
-returns raw value
-also emits otel metric internally
+REJECTION CONDITIONS:
 
-passive mode disabled by default.
-
-============================================================
-AGENT REGISTRATION FLOW
-============================================================
-
-FIRST START:
-
-1) agent reads gorilla_agent.yaml
-2) generates agent_id (uuid)
-3) connects to backend bootstrap endpoint
-4) registers host metadata
-5) receives:
-   - tenant_id
-   - template assignment
-   - policy rules
-6) starts scheduler
+- missing resource attributes
+- invalid tenant
+- malformed batch
+- expired certificate
 
 ============================================================
-HEARTBEAT MODEL
+TENANT ISOLATION LAYER
 ============================================================
 
-INTERVAL: configurable (default 30s)
+FUNCTION:
 
-POST /api/v1/agent/heartbeat
+- enforce strict tenant boundary
+- attach tenant_id internally
+- prevent cross-tenant contamination
 
-payload:
+IMPLEMENTATION:
 
-- agent_id
-- hostname
-- version
-- last_export_timestamp
-- health_status
-
-NO telemetry data in heartbeat.
+- middleware enrichment
+- context-based tenant injection
+- partition key tagging
 
 ============================================================
-BACKEND INGEST PIPELINE
+METRICS PIPELINE
 ============================================================
 
-[ otlp receiver ]
-        ↓
-[ validation layer ]
-        ↓
-[ tenant isolation filter ]
-        ↓
-[ metrics processor ]
-[ logs processor ]
-[ traces processor ]
-        ↓
-[ storage layer ]
+PROCESSORS:
+
+- batch processor
+- attribute normalizer
+- aggregation processor
+- retention policy router
+
+STORAGE OPTIONS:
+
+PRIMARY:
+- timeseries optimized database
+
+REQUIREMENTS:
+
+- high write throughput
+- label-based indexing
+- shard by tenant
+- retention configurable per tenant
+- compression enabled
+
+DATA MODEL:
+
+metric_name
+timestamp
+value
+labels:
+  host.name
+  tenant.id
+  service.name
+  environment
+  template_id
+
+============================================================
+LOGS PIPELINE
+============================================================
+
+PROCESSORS:
+
+- structured log parser
+- severity normalizer
+- enrichment processor
+- retention router
+
+STORAGE REQUIREMENTS:
+
+- full-text search
+- time-based partitioning
+- tenant isolation
+- fast filtering by host/service
+
+DATA MODEL:
+
+timestamp
+tenant_id
+host.name
+service.name
+severity
+body
+attributes (jsonb)
+
+============================================================
+TRACES PIPELINE
+============================================================
+
+PROCESSORS:
+
+- span validator
+- trace assembler
+- dependency mapper
+- service graph builder
+
+STORAGE REQUIREMENTS:
+
+- trace_id index
+- span_id index
+- parent-child mapping
+- service dependency storage
+- time-based retention
+
+DATA MODEL:
+
+trace_id
+span_id
+parent_span_id
+tenant_id
+service.name
+operation
+start_time
+duration
+attributes
+
+============================================================
+STORAGE LAYER DESIGN
+============================================================
+
+METRICS DB:
+- append-only
+- partitioned by time + tenant
+- retention per tenant
+- compression required
+
+LOGS DB:
+- columnar or inverted index
+- partition by time
+- tenant filter mandatory
+
+TRACES DB:
+- optimized for trace reconstruction
+- secondary index on trace_id
+
+============================================================
+RETENTION MANAGEMENT
+============================================================
+
+PER TENANT CONFIG:
+
+metrics_retention_days
+logs_retention_days
+traces_retention_days
+
+automatic lifecycle policy:
+- hot storage
+- warm storage
+- delete
+
+============================================================
+BACKPRESSURE STRATEGY
+============================================================
+
+AGENT SIDE:
+- local buffer
+- exponential retry
+- disk spillover
+
+BACKEND SIDE:
+- ingestion queue
+- rate limiter
+- overload protection
+
+============================================================
+SCALABILITY MODEL
+============================================================
+
+- stateless ingestion tier
+- sharded storage
+- load balancer in front
+- autoscaling based on:
+    ingestion_rate
+    cpu
+    memory
+    queue depth
 
 ============================================================
 SECURITY MODEL
@@ -169,102 +282,53 @@ SECURITY MODEL
 
 REQUIRED:
 
-- tls 1.2+
-- cert validation
-- hostname verification
-- tenant scoping
-
-OPTIONAL:
-
-- certificate pinning
-- ip allowlist
-- rate limiting
+- mTLS preferred
+- certificate rotation
+- agent identity validation
+- per-tenant rate limiting
+- audit logging
 
 FORBIDDEN:
 
-- plaintext telemetry
-- shared global tokens
-- anonymous agent registration
+- shared tenant credentials
+- plaintext ingestion
+- telemetry without tenant.id
 
 ============================================================
-MULTI-TENANT ENFORCEMENT
+OBSERVABILITY OF THE OBSERVABILITY
 ============================================================
 
-every telemetry batch must contain:
+internal metrics exposed:
 
-tenant.id
+gorilla.ingestion.rate
+gorilla.ingestion.errors
+gorilla.pipeline.latency
+gorilla.storage.write_latency
+gorilla.queue.depth
 
-backend rejects batch if:
-
-- tenant missing
-- agent not registered
-- agent disabled
-- invalid signature
-
-============================================================
-FAILOVER STRATEGY
-============================================================
-
-agent side:
-
-- local buffer queue
-- retry with exponential backoff
-- disk fallback if memory full
-- max retention configurable
-
-backend side:
-
-- horizontal scalable otlp receivers
-- load balancer in front
+exported via internal otel
 
 ============================================================
-SCALABILITY DESIGN
+FAILURE ISOLATION
 ============================================================
 
-- stateless backend receivers
-- sharded storage
-- async ingestion
-- batching mandatory
-- compression enabled (gzip)
+- metrics failure does not block logs
+- logs failure does not block traces
+- independent pipelines
+- circuit breaker per pipeline
 
 ============================================================
-COMPATIBILITY WITH TEMPLATE MODEL
+FINAL ARCHITECTURE PRINCIPLES
 ============================================================
 
-template example:
-
-zt-os-linux
-
-backend defines:
-
-- metric keys
-- expected collection interval
-- threshold rules
-
-agent receives template
-maps template keys to collectors
-exports via otel metric name:
-
-gorilla.os.linux.disk_used
-gorilla.os.linux.cpu_usage
-
-frontend still displays key:
-
-disk_used
-cpu_usage
-
-============================================================
-FINAL ARCHITECTURE SUMMARY
-============================================================
-
-control plane  -> https api
-data plane     -> otlp grpc/http
-optional mode  -> passive tcp
-security       -> mTLS
-multi-tenant   -> mandatory attribute
-storage        -> separated pipelines
-no simulated telemetry
-no custom fake protocol
+- otel native
+- multi-tenant first
+- horizontally scalable
+- storage separated by signal type
+- zero simulated data
+- strict validation
+- enterprise security
+- template compatible
 
 ============================================================
 END
